@@ -56,7 +56,7 @@ if __name__ == "__main__":
     ModuleUpdate.update(yes="--yes" in sys.argv or "-y" in sys.argv)
 
 from worlds.LauncherComponents import components, icon_paths
-from Utils import version_tuple, is_windows, is_linux
+from Utils import version_tuple, is_windows, is_linux, is_macos 
 from Cython.Build import cythonize
 
 
@@ -94,8 +94,8 @@ def download_SNI():
     }
     platform_name = platform.system().lower()
     machine_name = platform.machine().lower()
-    # force amd64 on macos until we have universal2 sni, otherwise resolve to GOARCH
-    machine_name = "amd64" if platform_name == "darwin" else machine_to_go.get(machine_name, machine_name)
+    # force arm64 on macos until we have universal2 sni, otherwise resolve to GOARCH
+    machine_name = "universal" if platform_name == "darwin" else machine_to_go.get(machine_name, machine_name)
     with urllib.request.urlopen("https://api.github.com/repos/alttpo/sni/releases/latest") as request:
         data = json.load(request)
     files = data["assets"]
@@ -195,7 +195,7 @@ if is_windows:
     ))
 
 extra_data = ["LICENSE", "data", "EnemizerCLI", "SNI"]
-extra_libs = ["libssl.so", "libcrypto.so"] if is_linux else []
+extra_libs = ["libssl.so", "libcrypto.so"] if is_linux & is_macos else []
 
 
 def remove_sprites_from_folder(folder):
@@ -609,6 +609,92 @@ def find_libs(*args: str) -> typing.Sequence[typing.Tuple[str, str]]:
                 file = os.path.join(dirname, file)
     return res
 
+class AppBundleCommand(setuptools.Command):
+    description = "build a macOS app bundle from build output"
+    user_options = [
+        ("build-folder=", None, "Folder to convert to App Bundle."),
+        ("icon-file=", None, "The icon to use for the App Bundle."),
+        ("bundle-name=", None, "The name of the App Bundle."),
+        ("dist-folder=", None, "App Bundle output folder."),
+        ("app-icon=", None, "The icon to use for the App Bundle."),
+        ("app-exec=", None, "The application to run inside the bundle."),
+        ("yes", "y", 'Answer "yes" to all questions.'),
+    ]
+    build_folder: typing.Optional[Path]
+    icon_file: typing.Optional[Path]
+    bundle_name: str
+    dist_folder: typing.Optional[Path]
+    app_exec: typing.Optional[Path]
+    app_icon: typing.Optional[Path]  # source file
+    app_name: str
+    app_id: str  # lower case name, used for icon and .desktop
+    yes: bool
+
+    def initialize_options(self):
+        self.build_folder = None
+        self.dist_folder = None
+        self.app_name = self.distribution.metadata.name
+        self.app_icon = self.distribution.executables[0].icon
+        self.app_exec = Path('Contents/MacOS/ArchipelagoLauncher')
+        self.icon_file = resolve_icon("icon")
+        self.bundle_name = "Archipelago"
+        self.yes = False
+    
+    def finalize_options(self):
+        if not self.dist_folder:
+            self.dist_folder = self.build_folder.parent / f"{self.app_name}.app"
+        self.app_id = self.app_name.lower()
+
+    def run(self):
+        self.dist_folder.mkdir(parents=True, exist_ok=True)
+        contents_folder = self.dist_folder / "Contents"
+        contents_folder.mkdir(parents=True, exist_ok=True)
+        resources_folder = contents_folder / "Resources"
+        resources_folder.mkdir(parents=True, exist_ok=True)
+        macos_folder = contents_folder / "MacOS"
+        macos_folder.mkdir(parents=True, exist_ok=True)
+        frameworks_folder = contents_folder / "Frameworks"
+        frameworks_folder.mkdir(parents=True, exist_ok=True)
+        self.install_icon(self.icon_file, resources_folder / f"{self.app_id}.icns")
+        self.write_info_plist(contents_folder / "Info.plist")
+        # copy the build folder to the app bundle
+        shutil.copytree(self.build_folder, macos_folder, dirs_exist_ok=True)
+        if signtool:
+            print(f"Signing {self.app_exec}")
+            os.system(signtool + os.path.join(macos_folder, self.app_exec.name))
+        # archive the .app bundle
+        shutil.make_archive(self.dist_folder, "zip", self.dist_folder.parent, self.dist_folder.name)
+    
+    def install_icon(self, src: Path, dest: Path):
+        try:
+            from PIL import Image
+        except ModuleNotFoundError:
+            if not self.yes:
+                input("Requirement PIL is not satisfied, press enter to install it")
+            subprocess.call([sys.executable, '-m', 'pip', 'install', 'Pillow', '--upgrade'])
+            from PIL import Image
+        im = Image.open(src)
+        im.save(dest)
+
+    def write_info_plist(self, dest: Path):
+        with open(dest, 'w', encoding="utf-8") as f:
+            f.write("\n".join((
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+                '<plist version="1.0">',
+                '<dict>',
+                f'<key>CFBundleIdentifier</key><string>{self.app_id}</string>',
+                f'<key>CFBundleName</key><string>{self.app_name}</string>',
+                f'<key>CFBundleExecutable</key><string>{self.app_exec.name}</string>',
+                f'<key>CFBundleIconFile</key><string>resources/{self.app_id}.icns</string>',
+                '</dict>',
+                '</plist>',
+                ''
+            )))
+    
+
+ 
+    
 
 cx_Freeze.setup(
     name="Archipelago",
@@ -631,16 +717,25 @@ cx_Freeze.setup(
             "build_exe": buildfolder,
             "extra_data": extra_data,
             "extra_libs": extra_libs,
-            "bin_includes": ["libffi.so", "libcrypt.so"] if is_linux else []
+            "bin_includes": ["libffi.so", "libcrypt.so"] if is_linux & is_macos else [],
         },
         "bdist_appimage": {
            "build_folder": buildfolder,
         },
+        "bdist_mac": {
+            "build_folder": buildfolder,
+            "icon_file": resolve_icon("icon"),
+            "bundle_name": "Archipelago",
+
+
+    },
     },
     # override commands to get custom stuff in
     cmdclass={
         "build": BuildCommand,
         "build_exe": BuildExeCommand,
         "bdist_appimage": AppImageCommand,
+        # mac apple bundle
+        "bdist_mac": AppBundleCommand
     },
 )
